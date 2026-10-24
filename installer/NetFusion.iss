@@ -20,6 +20,7 @@ PrivilegesRequired=lowest
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\icon\netfusion.ico
 VersionInfoVersion=0.1.0.0
 CloseApplications=yes
 RestartApplications=no
@@ -34,8 +35,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "..\dist\NetFusion\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\NetFusion"; Filename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\NetFusion"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\NetFusion"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"
+Name: "{autodesktop}\NetFusion"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch NetFusion"; Flags: nowait postinstall skipifsilent

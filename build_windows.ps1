@@ -38,8 +38,11 @@ try {
     $pythonBase = & $python -c "import sys; print(sys.base_prefix)"
     try {
         $env:PATH = "$buildVenv\Scripts;$pythonBase;$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem"
+        & $python .\tools\build_icon.py
+        if ($LASTEXITCODE -ne 0) { throw "Could not build the Windows application icon." }
         & $python -m PyInstaller --noconfirm --clean --windowed --onedir `
             --contents-directory _internal --runtime-hook .\src\qt_dll_bootstrap.py `
+            --icon .\icon\netfusion.ico --add-data ".\icon\icon.png;icon" `
             --name NetFusion .\src\main.py
     } finally {
         $env:PATH = $originalPath

@@ -4,9 +4,10 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QSettings, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QPushButton, QSystemTrayIcon, QMenu, QVBoxLayout, QWidget,
@@ -15,6 +16,19 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "NetFusion"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def app_icon():
+    """Load the provided icon from source or the PyInstaller bundle."""
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return QIcon(str(bundle_root / "icon" / "icon.png"))
+
+
+class SnapshotThread(QThread):
+    snapshot_ready = Signal(object, object)
+
+    def run(self):
+        self.snapshot_ready.emit(*get_network_snapshot())
 
 
 def run_powershell(command):
@@ -89,26 +103,6 @@ def set_login_start(enabled):
         return False
 
 
-def make_tray_icon():
-    pixmap = QPixmap(64, 64)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#8ee7ff"))
-    painter.drawRoundedRect(3, 3, 58, 58, 16, 16)
-    painter.setPen(QPen(
-        QColor("#0b1020"), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap
-    ))
-    painter.drawLine(20, 22, 43, 42)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#0b1020"))
-    painter.drawEllipse(12, 13, 16, 16)
-    painter.drawEllipse(36, 35, 16, 16)
-    painter.end()
-    return QIcon(pixmap)
-
-
 class StatCard(QFrame):
     def __init__(self, eyebrow, value, detail):
         super().__init__(); self.setObjectName("card")
@@ -146,6 +140,9 @@ class MainWindow(QMainWindow):
         self._last_counters = {}
         self._last_sample = time.monotonic()
         self._tray_exit = False
+        self._snapshot_thread = None
+        self._refresh_pending = False
+        self.setWindowIcon(app_icon())
         self.setWindowTitle("NetFusion"); self.resize(920, 700); self.setMinimumSize(720, 560)
         self.build_ui(); self.setup_tray(); self.refresh()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh); self.timer.start(8000)
@@ -218,7 +215,7 @@ class MainWindow(QMainWindow):
 
     def setup_tray(self):
         self.tray = QSystemTrayIcon(self); self.tray.setToolTip("NetFusion — passive network monitor")
-        self.tray.setIcon(make_tray_icon())
+        self.tray.setIcon(app_icon())
         menu = QMenu()
         show = QAction("Open NetFusion", self); show.triggered.connect(self.show_window); menu.addAction(show)
         self.tray_boost_action = QAction("Boost Connections (preview)", self)
@@ -299,7 +296,25 @@ class MainWindow(QMainWindow):
         self.tray_stop_action.setEnabled(self.preview_active)
 
     def refresh(self):
-        adapters, counter_rows = get_network_snapshot()
+        if self._snapshot_thread is not None and self._snapshot_thread.isRunning():
+            self._refresh_pending = True
+            return
+        self._refresh_pending = False
+        thread = SnapshotThread(self)
+        self._snapshot_thread = thread
+        thread.snapshot_ready.connect(self.apply_snapshot)
+        thread.finished.connect(self.snapshot_finished)
+        thread.start()
+
+    def snapshot_finished(self):
+        thread = self._snapshot_thread
+        self._snapshot_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        if self._refresh_pending:
+            self.refresh()
+
+    def apply_snapshot(self, adapters, counter_rows):
         counters = {x.get("Name"): x for x in counter_rows if x.get("Name")}
         physical = []
         for adapter in adapters:
@@ -364,6 +379,8 @@ class MainWindow(QMainWindow):
     def exit_app(self):
         self._tray_exit = True
         self.stop_preview("NetFusion exited. Windows network settings were not changed.")
+        if self._snapshot_thread is not None and self._snapshot_thread.isRunning():
+            self._snapshot_thread.wait(7000)
         self.tray.hide(); QApplication.quit()
 
     def closeEvent(self, event):
@@ -382,7 +399,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setFont(QFont("Segoe UI", 10))
-    app.setWindowIcon(make_tray_icon())
+    app.setWindowIcon(app_icon())
     app.setStyleSheet("""
         QWidget#root { background:#0b1020; color:#edf2ff; }
         QScrollArea#contentScroll, QScrollArea#contentScroll QWidget#qt_scrollarea_viewport { background:transparent; border:0; }

@@ -5,10 +5,10 @@ NetFusion is a Windows 10/11 desktop monitor for physical Ethernet and Wi-Fi ada
 ## Current behavior
 
 - The app can add itself to the current Windows user's sign-in startup entries. The setting is enabled by default and can be turned off in the dashboard. Startup launches the app hidden in the system tray.
-- Adapter state and counters are fetched together through one read-only PowerShell call. The dashboard refreshes every eight seconds while open and every 30 seconds while hidden in the tray to reduce background work. Only physical Ethernet and Wi-Fi are included in readiness and throughput; virtual adapters such as WARP are only checked for display and are never changed.
+- Adapter state and counters are fetched together through one read-only PowerShell call on a background thread, so a slow query does not freeze the dashboard. The dashboard refreshes every eight seconds while open and every 30 seconds while hidden in the tray to reduce background work. Only physical Ethernet and Wi-Fi are included in readiness and throughput; virtual adapters such as WARP are only checked for display and are never changed.
 - The Boost button stays clickable and explains which link is missing. A monitor-only preview starts only when a physical Ethernet and Wi-Fi adapter are both up. If either link goes down, the preview stops and the app returns to passive mode.
 - Boost preview is a readiness/monitoring state. It does not combine, route, or balance traffic. No working bonding engine exists in this build.
-- A single download split across both ISPs generally needs a remote aggregation server as well as a routing/tunnel engine. The UI does not claim otherwise.
+- This build has no connection aggregation engine. A HypoMux-like multi-connection scheduler can assign separate new connections to different uplinks; a single TCP connection split across uplinks is a different feature and requires a remote bonding endpoint. See the [HypoMux aggregation guide](https://hypomux.com/en/docs/aggregation) for the distinction.
 
 ## Run on Windows
 
@@ -49,6 +49,6 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build_windows.ps1
 ```
 
-The build pins PySide6 Essentials to 6.9.3 and isolates PyInstaller from unrelated Conda and toolchain DLLs on `PATH`; newer Qt wheels in this environment can resolve an incompatible ICU DLL and fail during startup. The installer is written to `dist\installer\NetFusion-Setup-x64.exe`. It installs per-user under Local AppData, adds a Start Menu shortcut, and can optionally add a desktop shortcut. It includes the app runtime, so end users do not need Python.
+The build pins PySide6 Essentials to 6.9.3 and isolates both icon generation and PyInstaller from unrelated Conda and toolchain DLLs on `PATH`; newer Qt wheels in this environment can resolve an incompatible ICU DLL and fail during startup. It generates `icon\netfusion.ico` from the supplied `icon\icon.png` and embeds the icon in the app, tray, installer, and shortcuts. The installer is written to `dist\installer\NetFusion-Setup-x64.exe`. It installs per-user under Local AppData, adds a Start Menu shortcut, and can optionally add a desktop shortcut. It includes the app runtime, so end users do not need Python.
 
 The frozen app registers its bundled PySide6 and Shiboken DLL directories before importing Qt. This avoids relying on a developer machine's PATH when launching the installed app. The installer is currently unsigned, so Windows SmartScreen may show an unknown-publisher warning. Public release should use a trusted code-signing certificate. The Inno Setup 6 compiler used for this build states non-commercial use only; obtain the appropriate license before commercial distribution.
