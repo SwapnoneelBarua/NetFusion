@@ -5,10 +5,12 @@ NetFusion is a Windows 10/11 desktop monitor for physical Ethernet and Wi-Fi ada
 ## Current behavior
 
 - The app can add itself to the current Windows user's sign-in startup entries. The setting is enabled by default and can be turned off in the dashboard. Startup launches the app hidden in the system tray.
-- Adapter state and counters are fetched together through one read-only PowerShell call on a background thread, so a slow query does not freeze the dashboard. The dashboard refreshes every eight seconds while open and every 30 seconds while hidden in the tray to reduce background work. Only physical Ethernet and Wi-Fi are included in readiness and throughput; virtual adapters such as WARP are only checked for display and are never changed.
-- The Boost button stays clickable and explains which link is missing. A monitor-only preview starts only when a physical Ethernet and Wi-Fi adapter are both up. If either link goes down, the preview stops and the app returns to passive mode.
-- Boost preview is a readiness/monitoring state. It does not combine, route, or balance traffic. No working bonding engine exists in this build.
-- This build has no connection aggregation engine. A HypoMux-like multi-connection scheduler can assign separate new connections to different uplinks; a single TCP connection split across uplinks is a different feature and requires a remote bonding endpoint. See the [HypoMux aggregation guide](https://hypomux.com/en/docs/aggregation) for the distinction.
+- Adapter state, IPv4 addresses, default gateways, and counters are fetched in one read-only PowerShell call on a background thread. The dashboard refreshes every eight seconds while open and every 30 seconds while hidden in the tray. Readiness requires an active physical Ethernet and Wi-Fi path with an IPv4 address and gateway.
+- Passive mode never starts the proxy or changes Windows proxy, routes, DNS, or Cloudflare WARP. Startup remains passive.
+- Boost starts local HTTP/HTTPS (`127.0.0.1:10801`) and SOCKS5 (`127.0.0.1:10800`) proxies. The scheduler assigns each new connection to one selected adapter using a Windows per-socket interface setting. It does not change the routing table or DNS.
+- If no Windows proxy, PAC URL, or auto-detect proxy is active, Boost temporarily points the current user's Windows proxy setting at NetFusion for apps that honor the Windows user proxy. It first stores an encrypted recovery record and restores the previous values on Stop, adapter loss, or normal app exit. If an existing proxy configuration is active, NetFusion leaves it alone and shows the local addresses for manual app setup.
+- The local proxy distributes separate IPv4 TCP connections. It does not split one TCP connection across links, and applications that ignore the Windows proxy need to be configured manually. IPv6 destinations are not supported in this first proxy build. This follows the same multi-connection boundary described in the [HypoMux aggregation guide](https://hypomux.com/en/docs/aggregation).
+- Boost is disabled while a Cloudflare WARP adapter is active, because active-mode coexistence has not yet been validated. Passive monitoring leaves WARP untouched.
 
 ## Run on Windows
 
@@ -31,14 +33,14 @@ python .\src\main.py --tray
 
 ## Manual behavior check
 
-1. Start the app with Ethernet only. Confirm it says **Passive monitoring** and Windows networking behaves normally.
-2. Connect Wi-Fi. Confirm both adapters show as up and the preview button becomes available.
-3. Start **Boost preview**. Confirm the status says **Monitor only** and that the app states Windows routing is unchanged.
-4. Disconnect Wi-Fi. Within the next refresh, confirm the preview stops and Ethernet remains connected.
-5. Start and stop the preview from the tray menu. Confirm the app returns to passive monitoring.
-6. Toggle the sign-in checkbox and verify the per-user startup entry through Windows Task Manager's Startup Apps view.
+1. Start NetFusion with Ethernet only. Confirm it says **Passive monitoring** and the Windows proxy settings are unchanged.
+2. Connect Wi-Fi and confirm both adapters have an IPv4 address and default gateway.
+3. Start **Boost Connections**. If Windows has no active proxy/PAC configuration, verify the Windows user proxy points to `127.0.0.1:10801`; otherwise configure a test app manually. The SOCKS5 endpoint is `127.0.0.1:10800`.
+4. Use a multi-connection download and inspect whether new connections use both links. One connection remains on one link.
+5. Stop Boost and verify the previous proxy settings return. Disconnect either adapter during Boost and verify it stops and restores the proxy within one refresh interval.
+6. With WARP active, confirm Boost is blocked. Toggle the sign-in checkbox and verify the Windows Startup Apps entry.
 
-This is a prototype; these are manual checks, not an automated test suite. Real traffic bonding and Cloudflare WARP coexistence under an active routing engine remain unimplemented.
+Local HTTP, HTTPS CONNECT, and SOCKS5 loopback checks pass. Mocked Windows proxy takeover, restoration, interrupted-session recovery, and existing-proxy preservation checks pass. The x64 installer compiles from this source revision. Real traffic across two independent uplinks, Steam compatibility, Windows proxy behavior across different applications, and active WARP coexistence still need end-to-end testing before a stable release.
 
 ## Build a Windows x64 installer
 

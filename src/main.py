@@ -1,4 +1,4 @@
-"""NetFusion monitor. Boost preview is deliberately monitor-only."""
+"""NetFusion monitor with an on-demand local per-connection proxy."""
 import json
 import os
 import subprocess
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QPushButton, QSystemTrayIcon, QMenu, QVBoxLayout, QWidget,
     QScrollArea,
 )
+from proxy_engine import AdapterPath, HTTP_PROXY_PORT, HTTP_PROXY_HOST, SOCKS_PROXY_PORT, LocalProxyEngine
+from proxy_settings import SystemProxyLease, recover_pending_system_proxy
 
 APP_NAME = "NetFusion"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -44,11 +46,22 @@ def run_powershell(command):
 
 
 def get_network_snapshot():
-    """Fetch adapter state and counters in one read-only PowerShell process."""
+    """Fetch adapter state, IPv4 egress details, and counters read-only."""
     command = (
         "$ErrorActionPreference='SilentlyContinue'; "
-        "$a=@(Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,LinkSpeed,"
-        "ifIndex,HardwareInterface); "
+        "$ips=@(Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred | "
+        "Where-Object {$_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1'} | "
+        "Select-Object InterfaceIndex,IPAddress); "
+        "$routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | "
+        "Select-Object InterfaceIndex,NextHop,RouteMetric); "
+        "$a=@(Get-NetAdapter | ForEach-Object { $n=$_; "
+        "$ip=$ips | Where-Object {$_.InterfaceIndex -eq $n.ifIndex} | Select-Object -First 1; "
+        "$gw=$routes | Where-Object {$_.InterfaceIndex -eq $n.ifIndex} | "
+        "Sort-Object RouteMetric | Select-Object -First 1; "
+        "[pscustomobject]@{Name=$n.Name;InterfaceDescription=$n.InterfaceDescription;"
+        "Status=$n.Status;LinkSpeed=$n.LinkSpeed;ifIndex=$n.ifIndex;"
+        "HardwareInterface=$n.HardwareInterface;IPv4Address=$(if($ip){$ip.IPAddress}else{''});"
+        "IPv4Gateway=$(if($gw){$gw.NextHop}else{''})} }); "
         "$s=@(Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes); "
         "[pscustomobject]@{adapters=$a;stats=$s} | ConvertTo-Json -Depth 4 -Compress"
     )
@@ -135,13 +148,21 @@ class MainWindow(QMainWindow):
     def __init__(self, start_hidden=False):
         super().__init__()
         self.settings = QSettings("NetFusion", "NetFusion")
-        self.preview_active = False
+        self.proxy_lease = SystemProxyLease(self.settings)
+        self.proxy_engine = None
+        self.system_proxy_managed = False
+        self.boost_active = False
         self._eligible = False
+        self._boost_paths = []
+        self._active_path_signature = ()
         self._last_counters = {}
         self._last_sample = time.monotonic()
         self._tray_exit = False
         self._snapshot_thread = None
         self._refresh_pending = False
+        self._online_kinds = set()
+        self._ready_kinds = set()
+        self._warp_active = False
         self.setWindowIcon(app_icon())
         self.setWindowTitle("NetFusion"); self.resize(920, 700); self.setMinimumSize(720, 560)
         self.build_ui(); self.setup_tray(); self.refresh()
@@ -175,9 +196,9 @@ class MainWindow(QMainWindow):
         self.engine_text = QLabel(); self.engine_text.setObjectName("muted"); self.engine_text.setWordWrap(True)
         hv.addWidget(self.engine_text)
         actions = QHBoxLayout(); actions.setSpacing(8)
-        self.start_btn = QPushButton("Boost Connections (preview)"); self.start_btn.setObjectName("primary")
-        self.start_btn.clicked.connect(self.start_preview)
-        self.stop_btn = QPushButton("Stop Boost"); self.stop_btn.clicked.connect(self.stop_preview)
+        self.start_btn = QPushButton("Boost Connections"); self.start_btn.setObjectName("primary")
+        self.start_btn.clicked.connect(self.start_boost)
+        self.stop_btn = QPushButton("Stop Boost"); self.stop_btn.clicked.connect(self.stop_boost)
         self.stop_btn.setEnabled(False)
         refresh_btn = QPushButton("Refresh"); refresh_btn.clicked.connect(self.refresh)
         actions.addWidget(self.start_btn); actions.addWidget(self.stop_btn); actions.addStretch(); actions.addWidget(refresh_btn)
@@ -210,7 +231,9 @@ class MainWindow(QMainWindow):
         self.warp_label = QLabel("Cloudflare WARP is not configured by NetFusion while passive.")
         self.warp_label.setObjectName("smallMuted"); self.warp_label.setWordWrap(True)
         settings_layout.addWidget(self.warp_label); cv.addWidget(settings_card)
-        note = QLabel("This build monitors readiness only. Actual connection bonding is not implemented yet.")
+        note = QLabel(
+            "Boost uses a local proxy to distribute separate connections. One connection is not split across links."
+        )
         note.setObjectName("smallMuted"); note.setWordWrap(True); cv.addWidget(note)
 
     def setup_tray(self):
@@ -218,10 +241,10 @@ class MainWindow(QMainWindow):
         self.tray.setIcon(app_icon())
         menu = QMenu()
         show = QAction("Open NetFusion", self); show.triggered.connect(self.show_window); menu.addAction(show)
-        self.tray_boost_action = QAction("Boost Connections (preview)", self)
-        self.tray_boost_action.triggered.connect(self.start_preview); menu.addAction(self.tray_boost_action)
+        self.tray_boost_action = QAction("Boost Connections", self)
+        self.tray_boost_action.triggered.connect(self.start_boost); menu.addAction(self.tray_boost_action)
         self.tray_stop_action = QAction("Stop boost", self)
-        self.tray_stop_action.triggered.connect(self.stop_preview); self.tray_stop_action.setEnabled(False)
+        self.tray_stop_action.triggered.connect(self.stop_boost); self.tray_stop_action.setEnabled(False)
         menu.addAction(self.tray_stop_action)
         refresh = QAction("Refresh adapters", self); refresh.triggered.connect(self.refresh); menu.addAction(refresh)
         menu.addSeparator()
@@ -244,56 +267,119 @@ class MainWindow(QMainWindow):
             self.login_checkbox.blockSignals(False); return
         self.settings.setValue("launchAtLogin", enabled)
 
-    def start_preview(self):
+    def start_boost(self):
         self.refresh()
+        if self._warp_active:
+            QMessageBox.information(
+                self,
+                "Cloudflare WARP is active",
+                "Boost is paused while a WARP adapter is active. The local proxy pins new connections "
+                "to the selected physical adapter, and WARP coexistence has not been validated yet. "
+                "NetFusion has not changed your network settings.",
+            )
+            return
         if not self._eligible:
-            missing = [name for name in ("Ethernet", "Wi-Fi") if name not in self._online_kinds]
+            missing = [name for name in ("Ethernet", "Wi-Fi") if name not in self._ready_kinds]
             missing_text = " and ".join(missing)
             QMessageBox.information(
                 self, f"{missing_text} connection needed",
-                f"NetFusion currently sees {missing_text} as disconnected. Connect both physical Ethernet "
-                "and Wi-Fi, then click Boost Connections again. NetFusion remains passive for now.",
+                f"NetFusion needs an active IPv4 address and gateway on both Ethernet and Wi-Fi. "
+                f"It is currently missing: {missing_text}. Connect both links, refresh, then try again.",
             )
             return
-        self.preview_active = True; self.update_mode_ui()
-        self.tray.showMessage("NetFusion", "Boost preview active. Windows normal routing is unchanged.",
-                              QSystemTrayIcon.MessageIcon.Information, 3000)
+        if self.boost_active:
+            return
+        engine = LocalProxyEngine(self._boost_paths)
+        try:
+            engine.start()
+            takeover = self.proxy_lease.acquire()
+        except Exception as exc:
+            engine.stop()
+            QMessageBox.warning(
+                self, "Could not start Boost",
+                f"NetFusion could not start its local proxy or prepare the Windows proxy setting.\n\n{exc}",
+            )
+            return
+        self.proxy_engine = engine
+        self._active_path_signature = self._path_signature(self._boost_paths)
+        self.system_proxy_managed = takeover == "managed"
+        self.boost_active = True
+        self.update_mode_ui()
+        message = (
+            f"Boost is active. New proxy connections are assigned across available links."
+            if self.system_proxy_managed else
+            f"Local proxy is active at {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT}; existing Windows proxy settings "
+            "were preserved. Configure an app to use this HTTP proxy or SOCKS5 at "
+            f"{HTTP_PROXY_HOST}:{SOCKS_PROXY_PORT}."
+        )
+        self.tray.showMessage("NetFusion", message, QSystemTrayIcon.MessageIcon.Information, 5000)
 
-    def stop_preview(self, reason=None):
-        if not self.preview_active: return
-        self.preview_active = False; self.update_mode_ui()
-        self.tray.showMessage("NetFusion", reason or "Preview stopped. Network settings were not changed.",
-                              QSystemTrayIcon.MessageIcon.Information, 3500)
+    def stop_boost(self, reason=None):
+        if not self.boost_active:
+            return
+        was_managed = self.system_proxy_managed
+        if was_managed:
+            restored, restore_message = self.proxy_lease.release()
+        else:
+            restored, restore_message = True, ""
+        engine = self.proxy_engine
+        self.proxy_engine = None
+        if engine is not None:
+            engine.stop()
+        self.system_proxy_managed = False
+        self.boost_active = False
+        self._active_path_signature = ()
+        self.update_mode_ui()
+        if restore_message and not restored:
+            message = restore_message
+        else:
+            default_message = (
+                "Boost stopped. NetFusion restored the previous proxy settings; routes and DNS were not changed."
+                if was_managed else
+                "Boost stopped. Windows proxy settings were left unchanged; routes and DNS were not changed."
+            )
+            message = reason or default_message
+            if restore_message and "changed by another app" in restore_message:
+                message = restore_message
+        self.tray.showMessage("NetFusion", message, QSystemTrayIcon.MessageIcon.Information, 5000)
 
     def update_mode_ui(self):
-        if self.preview_active:
-            self.engine_badge.setText("●  BOOST PREVIEW · MONITOR ONLY")
-            self.engine_text.setText(
-                "Preview is active because you requested it. NetFusion checks both links, but this build has "
-                "no traffic-balancing engine; Windows routing and WARP remain untouched."
-            )
+        if self.boost_active:
+            self.engine_badge.setText("●  BOOST ACTIVE")
+            if self.system_proxy_managed:
+                self.engine_text.setText(
+                    "Local HTTP/HTTPS and SOCKS5 proxies are active. New proxy connections are distributed "
+                    "across Ethernet and Wi-Fi; each individual connection stays on one link."
+                )
+            else:
+                self.engine_text.setText(
+                    f"Local proxies are active at {HTTP_PROXY_HOST}:{HTTP_PROXY_PORT} (HTTP/HTTPS) and "
+                    f"{HTTP_PROXY_HOST}:{SOCKS_PROXY_PORT} (SOCKS5). Windows proxy settings were left unchanged."
+                )
         else:
             self.engine_badge.setText("●  PASSIVE MONITORING")
             self.engine_text.setText(
-                "Passive mode only reads adapter status and counters. It does not change routes, DNS, "
-                "proxy settings, or Cloudflare WARP."
+                "Passive mode only reads adapter status and counters. The local proxy is stopped; routes, "
+                "DNS, Windows proxy settings, and Cloudflare WARP are untouched."
             )
-        if self.preview_active:
-            self.start_btn.setText("Boost Preview Active")
-            self.boost_hint.setText("Monitor-only preview. Internet traffic is not being combined.")
-        else:
-            self.start_btn.setText("Boost Connections (preview)")
-            missing = [name for name in ("Ethernet", "Wi-Fi") if name not in self._online_kinds]
+        if self.boost_active:
+            self.start_btn.setText("Boost Active")
             self.boost_hint.setText(
-                "Both links are ready. Preview only; this build does not combine traffic."
-                if not missing else "Click Boost for details. Waiting for: " + " + ".join(missing) + "."
+                "New proxy connections use one selected link each. Single-connection splitting is not provided."
+            )
+        else:
+            self.start_btn.setText("Boost Connections")
+            missing = [name for name in ("Ethernet", "Wi-Fi") if name not in self._ready_kinds]
+            self.boost_hint.setText(
+                "Both links have an IPv4 address and gateway."
+                if not missing else "Waiting for a working IPv4 path on: " + " + ".join(missing) + "."
             )
         # Keep this clickable while links are missing so the user gets a clear
         # explanation instead of an apparently dead button.
-        self.start_btn.setEnabled(not self.preview_active)
-        self.stop_btn.setEnabled(self.preview_active)
-        self.tray_boost_action.setEnabled(not self.preview_active)
-        self.tray_stop_action.setEnabled(self.preview_active)
+        self.start_btn.setEnabled(not self.boost_active)
+        self.stop_btn.setEnabled(self.boost_active)
+        self.tray_boost_action.setEnabled(not self.boost_active)
+        self.tray_stop_action.setEnabled(self.boost_active)
 
     def refresh(self):
         if self._snapshot_thread is not None and self._snapshot_thread.isRunning():
@@ -323,8 +409,26 @@ class MainWindow(QMainWindow):
                 adapter["_kind"] = kind; physical.append(adapter)
         online = {a["_kind"] for a in physical if a.get("Status") == "Up"}
         self._online_kinds = online
-        self._eligible = {"Ethernet", "Wi-Fi"}.issubset(online)
-        self.adapters_card.value.setText(f"{len(online)} / 2")
+        self._boost_paths = []
+        for adapter in physical:
+            if adapter.get("Status") != "Up":
+                continue
+            address = str(adapter.get("IPv4Address", "") or "").strip()
+            gateway = str(adapter.get("IPv4Gateway", "") or "").strip()
+            try:
+                interface_index = int(adapter.get("ifIndex", 0))
+            except (TypeError, ValueError):
+                interface_index = 0
+            if address and gateway and interface_index > 0:
+                self._boost_paths.append(AdapterPath(
+                    adapter.get("_kind", "Network") + " · " + adapter.get("Name", "Adapter"),
+                    interface_index,
+                    address,
+                    gateway,
+                ))
+        self._ready_kinds = {path.name.split(" · ", 1)[0] for path in self._boost_paths}
+        self._eligible = {"Ethernet", "Wi-Fi"}.issubset(self._ready_kinds)
+        self.adapters_card.value.setText(f"{len(self._ready_kinds)} / 2")
         if self._eligible:
             self.connection_summary.setText("Both connections are available")
         elif "Ethernet" in online:
@@ -337,8 +441,19 @@ class MainWindow(QMainWindow):
             any(word in " ".join(str(a.get(k, "")) for k in ("Name", "InterfaceDescription")).lower()
                 for word in ("warp", "cloudflare")) for a in adapters
         )
+        self._warp_active = any(
+            a.get("Status") == "Up" and
+            any(word in " ".join(str(a.get(k, "")) for k in ("Name", "InterfaceDescription")).lower()
+                for word in ("warp", "cloudflare"))
+            for a in adapters
+        )
         self.warp_label.setText(
-            "Cloudflare WARP adapter detected. It is left untouched while NetFusion is passive." if warp_found
+            (
+                "WARP adapter is active. Boost is disabled until active-mode compatibility is validated; "
+                "passive monitoring leaves WARP untouched."
+                if self._warp_active else
+                "Cloudflare WARP adapter detected. It is left untouched while NetFusion is passive."
+            ) if warp_found
             else "Cloudflare WARP is left untouched while NetFusion is passive."
         )
 
@@ -371,20 +486,40 @@ class MainWindow(QMainWindow):
         if not physical:
             label = QLabel("No physical Ethernet or Wi-Fi adapters found."); label.setObjectName("muted")
             self.adapter_layout.addWidget(label)
-        if self.preview_active and not self._eligible:
-            self.stop_preview("Ethernet or Wi-Fi disconnected. Preview stopped; the remaining link is unchanged.")
+        if self.boost_active and self._warp_active:
+            self.stop_boost(
+                "Cloudflare WARP became active. Boost stopped and NetFusion restored proxy settings."
+            )
+        elif self.boost_active and not self._eligible:
+            self.stop_boost(
+                "A selected link lost its IPv4 path. Boost stopped and NetFusion restored proxy settings."
+            )
+        elif self.boost_active and self._path_signature(self._boost_paths) != self._active_path_signature:
+            self.stop_boost(
+                "A network adapter changed while Boost was active. Boost stopped and NetFusion restored proxy settings."
+            )
         else:
             self.update_mode_ui()
 
+    @staticmethod
+    def _path_signature(paths):
+        return tuple(sorted(
+            (path.name, path.interface_index, path.ipv4_address, path.gateway)
+            for path in paths
+        ))
+
     def exit_app(self):
         self._tray_exit = True
-        self.stop_preview("NetFusion exited. Windows network settings were not changed.")
+        self.stop_boost("NetFusion exited. Boost stopped and proxy settings were restored.")
         if self._snapshot_thread is not None and self._snapshot_thread.isRunning():
             self._snapshot_thread.wait(7000)
         self.tray.hide(); QApplication.quit()
 
     def closeEvent(self, event):
         if not self._tray_exit and QSystemTrayIcon.isSystemTrayAvailable():
+            self.stop_boost(
+                "The dashboard closed, so Boost stopped and proxy settings were restored. NetFusion remains in the tray."
+            )
             event.ignore(); self.hide()
             self.tray.showMessage(
                 "NetFusion", "Still running in the system tray.",
@@ -427,10 +562,18 @@ if __name__ == "__main__":
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
     """)
     settings = QSettings("NetFusion", "NetFusion")
+    _, recovery_message = recover_pending_system_proxy(settings)
     launch_at_login = settings.value("launchAtLogin", True, type=bool)
     settings.setValue("launchAtLogin", launch_at_login)
     if launch_at_login: set_login_start(True)
     tray_mode = "--tray" in sys.argv
     window = MainWindow(start_hidden=tray_mode)
+    if recovery_message:
+        QTimer.singleShot(
+            0,
+            lambda message=recovery_message: window.tray.showMessage(
+                "NetFusion recovery", message, QSystemTrayIcon.MessageIcon.Warning, 7000
+            ),
+        )
     if not (tray_mode and QSystemTrayIcon.isSystemTrayAvailable()): window.show()
     sys.exit(app.exec())

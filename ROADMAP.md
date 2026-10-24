@@ -4,8 +4,9 @@ The current `v0.1.0` release is a passive network monitor. It does not combine t
 
 ## 1. Connection distribution engine
 
-- Start with a local HTTP/HTTPS and SOCKS5 proxy mode for proxy-aware download applications. Let users configure a proxy manually; make Windows system-proxy takeover an explicit active-mode option with exact save/restore behavior.
-- Bind each new outbound connection to a selected physical adapter and make the scheduler account for link availability and measured capacity. Keep established connections on their original path.
+- A first local HTTP/HTTPS and SOCKS5 proxy engine is implemented on `127.0.0.1`; it assigns each new TCP connection across eligible adapters in round-robin order and pins outbound sockets to an interface.
+- Keep the scope clear: this distributes separate connections only. A single TCP connection is not split across links.
+- Validate adapter selection and throughput with two independent internet uplinks, including Steam and other proxy-aware download applications. Established connections stay on their original path.
 - Treat broader system-wide routing for apps that ignore proxies as a separate virtual-adapter/Windows-filtering-driver milestone, with its own compatibility and recovery work.
 - Define behavior for applications that ignore the configured proxy and for long-lived connections that cannot move after they start.
 - Keep the product claim precise: separate connections can use separate uplinks; splitting one TCP connection across both links requires a remote bonding endpoint.
@@ -13,9 +14,10 @@ The current `v0.1.0` release is a passive network monitor. It does not combine t
 ## 2. Safe activation and recovery
 
 - Keep startup and passive mode read-only. Only an explicit Boost action may activate the engine.
-- Record the exact proxy, route, DNS, and adapter state the engine changes; restore only changes NetFusion owns.
+- For system proxy takeover, encrypt a recovery record with Windows DPAPI and restore only per-user proxy values that still match NetFusion's own values. NetFusion does not modify routes or DNS.
 - Restore state on Stop, link loss, application exit, failed startup, and reboot recovery. Never overwrite changes the user or another VPN made after Boost started.
-- Detect and fail closed when WARP, another VPN, proxy, or virtual adapter conflicts with the chosen mode; support active WARP coexistence only after it passes recovery and traffic-path tests.
+- Preserve existing proxy/PAC/auto-detect settings and expose local proxy ports for manual setup instead of taking over an already-active proxy.
+- Boost is blocked while a WARP adapter is active until coexistence and privacy behavior are tested. Then validate other VPNs and virtual adapters too.
 
 ## 3. Compatibility and reliability
 
@@ -26,4 +28,4 @@ The current `v0.1.0` release is a passive network monitor. It does not combine t
 
 ## Current milestone
 
-The supplied app icon is being integrated into the UI and Windows package, and adapter polling has been moved off the UI thread. The actual aggregation engine, active-mode network restoration, and compatibility validation remain unimplemented. The downloadable `v0.1.0` release still represents the original monitor build; publish a new version only after its source and installer have been built and verified together.
+The supplied app icon is integrated, adapter polling runs off the UI thread, and the local HTTP, HTTPS CONNECT, and SOCKS5 proxy paths pass loopback checks. Mocked Windows proxy takeover/restoration, recovery, and preservation checks pass; the x64 installer compiles from this source revision. The downloadable `v0.1.0` release still represents the original monitor build. Before a stable release, validate real traffic across both uplinks, Windows proxy behavior across applications, link loss on real adapters, Steam, installer launch on a clean machine, and active WARP behavior. Publish a new version only after its source and installer have been built and verified together.
