@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QLockFile, QSettings, QStandardPaths, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
@@ -18,6 +18,17 @@ from proxy_settings import SystemProxyLease, recover_pending_system_proxy
 
 APP_NAME = "NetFusion"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def app_version():
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    try:
+        return (bundle_root / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "development"
+
+
+APP_VERSION = app_version()
 
 
 def app_icon():
@@ -177,7 +188,7 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         titlebox = QVBoxLayout(); titlebox.setSpacing(3)
         title = QLabel("NetFusion"); title.setObjectName("pageTitle")
-        desc = QLabel("Your connections stay untouched until you ask for Boost."); desc.setObjectName("muted")
+        desc = QLabel(f"Version {APP_VERSION} · Your connections stay untouched until Boost."); desc.setObjectName("muted")
         titlebox.addWidget(title); titlebox.addWidget(desc); header.addLayout(titlebox); header.addStretch()
         self.engine_badge = QLabel("PASSIVE"); self.engine_badge.setObjectName("statusBadge")
         header.addWidget(self.engine_badge, alignment=Qt.AlignmentFlag.AlignVCenter); outer.addLayout(header)
@@ -232,7 +243,8 @@ class MainWindow(QMainWindow):
         self.warp_label.setObjectName("smallMuted"); self.warp_label.setWordWrap(True)
         settings_layout.addWidget(self.warp_label); cv.addWidget(settings_card)
         note = QLabel(
-            "Boost uses a local proxy to distribute separate connections. One connection is not split across links."
+            "Boost keeps each website on one link and distributes different websites across links. "
+            "One connection is not split across links."
         )
         note.setObjectName("smallMuted"); note.setWordWrap(True); cv.addWidget(note)
 
@@ -290,14 +302,32 @@ class MainWindow(QMainWindow):
         if self.boost_active:
             return
         engine = LocalProxyEngine(self._boost_paths)
+        proxy_started = False
         try:
             engine.start()
+            proxy_started = True
             takeover = self.proxy_lease.acquire()
         except Exception as exc:
-            engine.stop()
+            recovery_ok, recovery_message = recover_pending_system_proxy(self.settings)
+            recovery_failed = bool(recovery_message and not recovery_ok)
+            if proxy_started and recovery_failed:
+                # Keep the proxy alive if rollback failed; otherwise apps may
+                # still point at localhost after its listener has disappeared.
+                self.proxy_engine = engine
+                self.system_proxy_managed = True
+                self.boost_active = True
+                self._active_path_signature = self._path_signature(self._boost_paths)
+                self.update_mode_ui()
+            else:
+                engine.stop()
+            recovery_detail = (
+                "\n\nProxy recovery status: " + recovery_message
+                if recovery_message else ""
+            )
             QMessageBox.warning(
                 self, "Could not start Boost",
-                f"NetFusion could not start its local proxy or prepare the Windows proxy setting.\n\n{exc}",
+                f"NetFusion could not start its local proxy or prepare the Windows proxy setting.\n\n{exc}"
+                f"{recovery_detail}",
             )
             return
         self.proxy_engine = engine
@@ -316,10 +346,21 @@ class MainWindow(QMainWindow):
 
     def stop_boost(self, reason=None):
         if not self.boost_active:
-            return
+            return True
         was_managed = self.system_proxy_managed
         if was_managed:
             restored, restore_message = self.proxy_lease.release()
+            if not restored:
+                self.engine_badge.setText("●  RECOVERY NEEDS ATTENTION")
+                self.engine_text.setText(
+                    "NetFusion could not restore the Windows proxy setting. The local proxy is still running "
+                    "so traffic is not sent to a closed local port. Resolve the registry error, then try Stop again."
+                )
+                self.tray.showMessage(
+                    "NetFusion could not stop safely", restore_message,
+                    QSystemTrayIcon.MessageIcon.Critical, 10000,
+                )
+                return False
         else:
             restored, restore_message = True, ""
         engine = self.proxy_engine
@@ -330,6 +371,8 @@ class MainWindow(QMainWindow):
         self.boost_active = False
         self._active_path_signature = ()
         self.update_mode_ui()
+        if self.timer:
+            self.timer.setInterval(30000 if self.isHidden() else 8000)
         if restore_message and not restored:
             message = restore_message
         else:
@@ -342,14 +385,15 @@ class MainWindow(QMainWindow):
             if restore_message and "changed by another app" in restore_message:
                 message = restore_message
         self.tray.showMessage("NetFusion", message, QSystemTrayIcon.MessageIcon.Information, 5000)
+        return True
 
     def update_mode_ui(self):
         if self.boost_active:
             self.engine_badge.setText("●  BOOST ACTIVE")
             if self.system_proxy_managed:
                 self.engine_text.setText(
-                    "Local HTTP/HTTPS and SOCKS5 proxies are active. New proxy connections are distributed "
-                    "across Ethernet and Wi-Fi; each individual connection stays on one link."
+                    "Local HTTP/HTTPS and SOCKS5 proxies are active. Each destination host stays on one link; "
+                    "different hosts are distributed across Ethernet and Wi-Fi."
                 )
             else:
                 self.engine_text.setText(
@@ -365,7 +409,7 @@ class MainWindow(QMainWindow):
         if self.boost_active:
             self.start_btn.setText("Boost Active")
             self.boost_hint.setText(
-                "New proxy connections use one selected link each. Single-connection splitting is not provided."
+                "Connections to the same host stay together. One TCP connection is not split across links."
             )
         else:
             self.start_btn.setText("Boost Connections")
@@ -380,6 +424,12 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(self.boost_active)
         self.tray_boost_action.setEnabled(not self.boost_active)
         self.tray_stop_action.setEnabled(self.boost_active)
+        if hasattr(self, "timer"):
+            self.timer.setInterval(
+                5000 if self.boost_active and self.isHidden()
+                else 30000 if self.isHidden()
+                else 8000
+            )
 
     def refresh(self):
         if self._snapshot_thread is not None and self._snapshot_thread.isRunning():
@@ -509,31 +559,62 @@ class MainWindow(QMainWindow):
         ))
 
     def exit_app(self):
+        if not self.stop_boost(
+            "NetFusion exited. Boost stopped and proxy settings were restored."
+        ):
+            self._tray_exit = False
+            self.showNormal()
+            QMessageBox.critical(
+                self,
+                "Cannot exit safely",
+                "NetFusion kept Boost running because Windows proxy recovery failed. Fix the reported "
+                "setting problem and use Stop Boost before exiting, so apps are not left pointing at a closed proxy.",
+            )
+            return
         self._tray_exit = True
-        self.stop_boost("NetFusion exited. Boost stopped and proxy settings were restored.")
         if self._snapshot_thread is not None and self._snapshot_thread.isRunning():
             self._snapshot_thread.wait(7000)
         self.tray.hide(); QApplication.quit()
 
     def closeEvent(self, event):
-        if not self._tray_exit and QSystemTrayIcon.isSystemTrayAvailable():
-            self.stop_boost(
+        if not self._tray_exit:
+            if not self.stop_boost(
                 "The dashboard closed, so Boost stopped and proxy settings were restored. NetFusion remains in the tray."
-            )
-            event.ignore(); self.hide()
-            self.tray.showMessage(
-                "NetFusion", "Still running in the system tray.",
-                QSystemTrayIcon.MessageIcon.Information, 2500,
-            )
-        else: event.accept()
+            ):
+                event.ignore()
+                self.showNormal()
+                return
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                event.ignore(); self.hide()
+                self.tray.showMessage(
+                    "NetFusion", "Still running in the system tray.",
+                    QSystemTrayIcon.MessageIcon.Information, 2500,
+                )
+            else:
+                event.accept()
+        else:
+            event.accept()
 
     def hideEvent(self, event):
-        self.timer.setInterval(30000)
+        self.timer.setInterval(5000 if self.boost_active else 30000)
         super().hideEvent(event)
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setFont(QFont("Segoe UI", 10))
+    app = QApplication(sys.argv)
+    app.setOrganizationName("NetFusion")
+    app.setApplicationName(APP_NAME)
+    app.setFont(QFont("Segoe UI", 10))
+    lock_dir = Path(QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppLocalDataLocation
+    ))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(lock_dir / "NetFusion.lock"))
+    instance_lock.setStaleLockTime(30000)
+    if not instance_lock.tryLock(0):
+        if "--tray" not in sys.argv:
+            QMessageBox.information(None, "NetFusion is already running", "Open NetFusion from the system tray.")
+        sys.exit(0)
     app.setWindowIcon(app_icon())
     app.setStyleSheet("""
         QWidget#root { background:#0b1020; color:#edf2ff; }
@@ -562,7 +643,14 @@ if __name__ == "__main__":
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
     """)
     settings = QSettings("NetFusion", "NetFusion")
-    _, recovery_message = recover_pending_system_proxy(settings)
+    recovery_ok, recovery_message = recover_pending_system_proxy(settings)
+    if recovery_message and not recovery_ok:
+        QMessageBox.critical(
+            None,
+            "Windows proxy recovery failed",
+            recovery_message + "\n\nNetFusion will not start until the interrupted Boost proxy settings can be recovered.",
+        )
+        sys.exit(1)
     launch_at_login = settings.value("launchAtLogin", True, type=bool)
     settings.setValue("launchAtLogin", launch_at_login)
     if launch_at_login: set_login_start(True)

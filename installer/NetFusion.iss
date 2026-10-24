@@ -1,5 +1,7 @@
 #define AppName "NetFusion"
-#define AppVersion "0.1.0"
+#ifndef AppVersion
+#define AppVersion "0.0.0"
+#endif
 #define AppPublisher "NetFusion"
 #define AppExeName "NetFusion.exe"
 
@@ -21,7 +23,7 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=..\icon\netfusion.ico
-VersionInfoVersion=0.1.0.0
+VersionInfoVersion={#AppVersion}.0
 CloseApplications=yes
 RestartApplications=no
 

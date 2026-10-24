@@ -1,56 +1,58 @@
-# NetFusion (safe monitoring prototype)
+# NetFusion 1.0.1
 
-NetFusion is a Windows 10/11 desktop monitor for physical Ethernet and Wi-Fi adapters. It starts in passive mode. Passive mode reads adapter status and byte counters; it does not change Windows routes, DNS, proxy settings, firewall rules, or Cloudflare WARP.
+NetFusion is a Windows 10/11 x64 tray app with a passive network monitor and an on-demand local multi-path proxy. It starts passive: startup monitoring does not change Windows routes, DNS, proxy settings, firewall rules, or Cloudflare WARP.
 
-## Current behavior
+## What this build does
 
-- The app can add itself to the current Windows user's sign-in startup entries. The setting is enabled by default and can be turned off in the dashboard. Startup launches the app hidden in the system tray.
-- Adapter state, IPv4 addresses, default gateways, and counters are fetched in one read-only PowerShell call on a background thread. The dashboard refreshes every eight seconds while open and every 30 seconds while hidden in the tray. Readiness requires an active physical Ethernet and Wi-Fi path with an IPv4 address and gateway.
-- Passive mode never starts the proxy or changes Windows proxy, routes, DNS, or Cloudflare WARP. Startup remains passive.
-- Boost starts local HTTP/HTTPS (`127.0.0.1:10801`) and SOCKS5 (`127.0.0.1:10800`) proxies. The scheduler assigns each new connection to one selected adapter using a Windows per-socket interface setting. It does not change the routing table or DNS.
-- If no Windows proxy, PAC URL, or auto-detect proxy is active, Boost temporarily points the current user's Windows proxy setting at NetFusion for apps that honor the Windows user proxy. It first stores an encrypted recovery record and restores the previous values on Stop, adapter loss, or normal app exit. If an existing proxy configuration is active, NetFusion leaves it alone and shows the local addresses for manual app setup.
-- The local proxy distributes separate IPv4 TCP connections. It does not split one TCP connection across links, and applications that ignore the Windows proxy need to be configured manually. IPv6 destinations are not supported in this first proxy build. This follows the same multi-connection boundary described in the [HypoMux aggregation guide](https://hypomux.com/en/docs/aggregation).
-- Boost is disabled while a Cloudflare WARP adapter is active, because active-mode coexistence has not yet been validated. Passive monitoring leaves WARP untouched.
+- Detects physical Ethernet and Wi-Fi adapters, including Remote NDIS phone-tether adapters, and shows link state, IPv4 gateway, and byte counters.
+- Runs quietly in the system tray and can start at Windows sign-in. It never enables Boost automatically.
+- On an explicit **Boost Connections** action, starts local HTTP/HTTPS proxy `127.0.0.1:10801` and SOCKS5 proxy `127.0.0.1:10800`. New IPv4 TCP sessions are pinned to an adapter; sessions for the same destination host stay on one link, while new hosts are distributed across eligible links. This host affinity is intended to reduce website session failures caused by switching public IPs between parallel browser connections.
+- Uses the Windows user proxy only if no manual proxy, PAC, or auto-detect setting is already active. A protected recovery record allows NetFusion to restore its prior settings on Stop, adapter loss, normal exit, and next launch after an interrupted session. Existing proxy settings are preserved; in that case, configure a test application to use the local proxy endpoints manually.
+- Stops Boost if either eligible uplink disappears or a Cloudflare WARP adapter becomes active. WARP remains untouched in passive mode.
 
-## Run on Windows
+## Important limits
 
-From the project folder in PowerShell:
+This is per-connection distribution, not a virtual network adapter or a full system-wide router. Each TCP connection uses one uplink for its lifetime; NetFusion does not split a single connection or a single download stream across links. A single-download speed increase requires the downloading app to make multiple proxy-aware connections. Some applications ignore the Windows proxy and need manual proxy configuration. IPv6 proxy destinations are not supported. Active WARP coexistence is intentionally blocked and has not been validated. Steam behavior has not yet been confirmed.
+
+The 1.0.1 source has passed local HTTP, HTTPS CONNECT, SOCKS5, host-affinity, stop/recovery mock tests and live direct/proxy reachability checks over two physical interfaces. Those live checks confirm adapter pinning and proxy reachability; they do not prove that Steam or every Windows app uses both links. The Windows proxy lifecycle tests use a mocked registry and do not change this PC's proxy settings. Test Chrome and other target applications after installing the rebuilt package before relying on it for important downloads.
+
+## Run from source
+
+In PowerShell, from the project folder:
 
 ```powershell
-py -3.14 -m venv .venv314
-.\.venv314\Scripts\Activate.ps1
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python .\src\main.py
 ```
 
-The first run enables launch at sign-in by default and stores a per-user Run entry. In the dashboard, clear **Launch at Windows sign-in and stay in the tray** to remove that entry. To exit instead of minimizing to tray, use the tray icon's **Exit NetFusion** menu item.
-
-To run it directly in the tray for a manual startup check:
+To open directly into the tray for a startup check:
 
 ```powershell
 python .\src\main.py --tray
 ```
 
-## Manual behavior check
+The first run enables launch at sign-in by default. Turn it off in the dashboard. Use the tray menu's **Exit NetFusion** item to exit; closing the dashboard minimizes the app to the tray.
 
-1. Start NetFusion with Ethernet only. Confirm it says **Passive monitoring** and the Windows proxy settings are unchanged.
-2. Connect Wi-Fi and confirm both adapters have an IPv4 address and default gateway.
-3. Start **Boost Connections**. If Windows has no active proxy/PAC configuration, verify the Windows user proxy points to `127.0.0.1:10801`; otherwise configure a test app manually. The SOCKS5 endpoint is `127.0.0.1:10800`.
-4. Use a multi-connection download and inspect whether new connections use both links. One connection remains on one link.
-5. Stop Boost and verify the previous proxy settings return. Disconnect either adapter during Boost and verify it stops and restores the proxy within one refresh interval.
-6. With WARP active, confirm Boost is blocked. Toggle the sign-in checkbox and verify the Windows Startup Apps entry.
+## Build the Windows x64 installer
 
-Local HTTP, HTTPS CONNECT, and SOCKS5 loopback checks pass. Mocked Windows proxy takeover, restoration, interrupted-session recovery, and existing-proxy preservation checks pass. The x64 installer compiles from this source revision. Real traffic across two independent uplinks, Steam compatibility, Windows proxy behavior across different applications, and active WARP coexistence still need end-to-end testing before a stable release.
-
-## Build a Windows x64 installer
-
-Build on 64-bit Windows with Python 3.14 and Inno Setup 6 installed. The build script creates a separate `.venv-build314` environment, uses PySide6 Essentials 6.9.3 (QtCore, QtGui, and QtWidgets), and rebuilds the app with PyInstaller before making the installer. It also isolates packaging from unrelated native DLLs on `PATH`, which previously caused QtCore to bind to an incompatible ICU library. Then run:
+Install 64-bit Python 3.14 and Inno Setup 6, then run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\build_windows.ps1
 ```
 
-The build pins PySide6 Essentials to 6.9.3 and isolates both icon generation and PyInstaller from unrelated Conda and toolchain DLLs on `PATH`; newer Qt wheels in this environment can resolve an incompatible ICU DLL and fail during startup. It generates `icon\netfusion.ico` from the supplied `icon\icon.png` and embeds the icon in the app, tray, installer, and shortcuts. The installer is written to `dist\installer\NetFusion-Setup-x64.exe`. It installs per-user under Local AppData, adds a Start Menu shortcut, and can optionally add a desktop shortcut. It includes the app runtime, so end users do not need Python.
+The script builds the app with the pinned PySide6 Essentials runtime and creates `dist\installer\NetFusion-Setup-x64.exe`. The installer includes Python and Qt runtime files, so users do not need to install Python. The installer is currently unsigned; Windows SmartScreen may show an unknown-publisher warning. Inno Setup 6's compiler states non-commercial use only; obtain an appropriate license before commercial distribution.
 
-The frozen app registers its bundled PySide6 and Shiboken DLL directories before importing Qt. This avoids relying on a developer machine's PATH when launching the installed app. The installer is currently unsigned, so Windows SmartScreen may show an unknown-publisher warning. Public release should use a trusted code-signing certificate. The Inno Setup 6 compiler used for this build states non-commercial use only; obtain the appropriate license before commercial distribution.
+## Verification
+
+Run the source tests with:
+
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+python -m unittest discover -s tests -v
+```
+
+Version is stored in `VERSION`. Update it before building a new release.

@@ -156,7 +156,7 @@ def recover_pending_system_proxy(settings) -> tuple[bool, str]:
         settings.sync()
         if len(changed) == len(PROXY_KEYS):
             return True, "Recovered the previous Windows proxy settings after an interrupted Boost session."
-        return bool(changed), "Restored NetFusion-owned proxy values; values changed by another app were left alone."
+        return True, "Restored NetFusion-owned proxy values; values changed by another app were left alone."
     except Exception as exc:
         return False, f"Could not recover a saved Windows proxy state: {exc}"
 

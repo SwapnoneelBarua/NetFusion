@@ -2,6 +2,11 @@ $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $project
 try {
+    $appVersion = (Get-Content -LiteralPath (Join-Path $project "VERSION") -Raw).Trim()
+    if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
+        throw "VERSION must contain a stable numeric semantic version (for example 1.0.0). Found: $appVersion"
+    }
+
     # Build with Python 3.14 and the pinned Qt 6.9.3 wheel. Qt 6.10+ in this
     # environment has an ICU dependency that can bind to incompatible external
     # ICU DLLs on PATH.
@@ -36,13 +41,46 @@ try {
     # off PyInstaller's analysis PATH so they cannot be copied into the app.
     $originalPath = $env:PATH
     $pythonBase = & $python -c "import sys; print(sys.base_prefix)"
+    $versionInfoPath = Join-Path $project "tools\version_info.generated.txt"
+    $versionParts = $appVersion.Split('.') | ForEach-Object { [int]$_ }
+    $fileVersion = "($($versionParts[0]), $($versionParts[1]), $($versionParts[2]), 0)"
+    $versionInfo = @"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=$fileVersion,
+    prodvers=$fileVersion,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('040904B0', [
+        StringStruct('CompanyName', 'NetFusion'),
+        StringStruct('FileDescription', 'NetFusion multi-path proxy'),
+        StringStruct('FileVersion', '$appVersion'),
+        StringStruct('InternalName', 'NetFusion'),
+        StringStruct('OriginalFilename', 'NetFusion.exe'),
+        StringStruct('ProductName', 'NetFusion'),
+        StringStruct('ProductVersion', '$appVersion')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"@
+    Set-Content -LiteralPath $versionInfoPath -Value $versionInfo -Encoding utf8
     try {
         $env:PATH = "$buildVenv\Scripts;$pythonBase;$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem"
         & $python .\tools\build_icon.py
         if ($LASTEXITCODE -ne 0) { throw "Could not build the Windows application icon." }
         & $python -m PyInstaller --noconfirm --clean --windowed --onedir `
             --contents-directory _internal --runtime-hook .\src\qt_dll_bootstrap.py `
-            --icon .\icon\netfusion.ico --add-data ".\icon\icon.png;icon" `
+            --icon .\icon\netfusion.ico --version-file $versionInfoPath `
+            --add-data ".\icon\icon.png;icon" --add-data ".\VERSION;." `
             --name NetFusion .\src\main.py
     } finally {
         $env:PATH = $originalPath
@@ -70,7 +108,7 @@ try {
         throw "Inno Setup is required. Install it, then rerun this script. Download: https://jrsoftware.org/isdl.php"
     }
 
-    & $compilerPath .\installer\NetFusion.iss
+    & $compilerPath "/DAppVersion=$appVersion" .\installer\NetFusion.iss
     if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed." }
     Write-Host "Installer created: $project\dist\installer\NetFusion-Setup-x64.exe"
 } finally {

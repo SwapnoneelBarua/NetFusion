@@ -13,6 +13,7 @@ __pycache__/
 /diag-build*/
 /diag-dist/
 /diag-dist*/
+tools/version_info.generated.txt
 
 # Local editor and OS files
 .vscode/
