@@ -1,0 +1,21 @@
+# Python environments and bytecode
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+
+# Generated application builds and installers
+/build/
+/build-*/
+/dist/
+/dist-*/
+/diag-build/
+/diag-build*/
+/diag-dist/
+/diag-dist*/
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
