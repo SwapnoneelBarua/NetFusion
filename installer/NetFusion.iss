@@ -1,6 +1,6 @@
 #define AppName "NetFusion"
 #ifndef AppVersion
-#define AppVersion "0.0.0"
+#define AppVersion "1.0.2"
 #endif
 #define AppPublisher "NetFusion"
 #define AppExeName "NetFusion.exe"
